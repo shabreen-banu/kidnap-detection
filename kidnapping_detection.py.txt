@@ -1,0 +1,174 @@
+import cv2
+import numpy as np
+from ultralytics import YOLO
+from collections import deque, defaultdict
+import os
+import time
+
+# -------------------------------
+# Parameters
+# -------------------------------
+MIN_FRAMES_TO_FLAG = 10
+PREBUFFER_SEC = 3
+POSTBUFFER_SEC = 5
+DISTANCE_OVERLAP_RATIO = 0.6
+VELOCITY_THRESHOLD = 6.0
+
+OUTPUT_DIR = "outputs"
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+# -------------------------------
+# YOLO Model
+# -------------------------------
+yolo = YOLO("yolov8n.pt")
+
+# -------------------------------
+# Tracking Helpers
+# -------------------------------
+next_id = 0
+tracks = {}
+MAX_LOST = 30
+
+def centroid(box):
+    x1, y1, x2, y2 = box
+    return ((x1 + x2) / 2, (y1 + y2) / 2)
+
+def iou(a, b):
+    x1 = max(a[0], b[0])
+    y1 = max(a[1], b[1])
+    x2 = min(a[2], b[2])
+    y2 = min(a[3], b[3])
+    if x2 < x1 or y2 < y1:
+        return 0.0
+    inter = (x2 - x1) * (y2 - y1)
+    areaA = (a[2] - a[0]) * (a[3] - a[1])
+    areaB = (b[2] - b[0]) * (b[3] - b[1])
+    return inter / (areaA + areaB - inter + 1e-6)
+
+def update_tracks(detections, frame_idx):
+    global next_id, tracks
+
+    for tid in tracks:
+        tracks[tid]['matched'] = False
+
+    for box in detections:
+        best_id, best_iou = None, 0
+        for tid, t in tracks.items():
+            if t.get('matched'):
+                continue
+            val = iou(box, t['bbox'])
+            if val > best_iou:
+                best_iou = val
+                best_id = tid
+
+        if best_iou > 0.2 and best_id is not None:
+            tracks[best_id]['bbox'] = box
+            tracks[best_id]['centroid'] = centroid(box)
+            tracks[best_id]['last_seen'] = frame_idx
+            tracks[best_id]['matched'] = True
+        else:
+            tracks[next_id] = {
+                'bbox': box,
+                'centroid': centroid(box),
+                'last_seen': frame_idx,
+                'history': deque(maxlen=30)
+            }
+            next_id += 1
+
+    lost = [tid for tid, t in tracks.items() if frame_idx - t['last_seen'] > MAX_LOST]
+    for tid in lost:
+        del tracks[tid]
+
+def speed(tid):
+    h = list(tracks[tid]['history'])
+    if len(h) < 3:
+        return 0.0
+    (x1, y1), (x2, y2) = h[-3], h[-1]
+    return np.hypot(x2 - x1, y2 - y1) / 3.0
+
+# -------------------------------
+# Main Function
+# -------------------------------
+def process_video_file(video_path):
+    cap = cv2.VideoCapture(video_path)
+    fps = cap.get(cv2.CAP_PROP_FPS) or 25
+
+    buf_frames = int(PREBUFFER_SEC * fps)
+    postbuf_frames = int(POSTBUFFER_SEC * fps)
+
+    ring = deque(maxlen=buf_frames + postbuf_frames + 50)
+    suspicious = defaultdict(int)
+    saved = 0
+    frame_idx = 0
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        frame_idx += 1
+        ring.append(frame.copy())
+
+        results = yolo(frame, imgsz=640, conf=0.35, classes=[0])
+        boxes = []
+
+        for r in results:
+            for box in r.boxes:
+                x1, y1, x2, y2 = map(int, box.xyxy[0])
+                boxes.append((x1, y1, x2, y2))
+
+        update_tracks(boxes, frame_idx)
+
+        for tid in tracks:
+            tracks[tid]['history'].append(tracks[tid]['centroid'])
+
+        ids = list(tracks.keys())
+        for i in range(len(ids)):
+            for j in range(i + 1, len(ids)):
+                a, b = ids[i], ids[j]
+                cA, cB = tracks[a]['centroid'], tracks[b]['centroid']
+                wA = tracks[a]['bbox'][2] - tracks[a]['bbox'][0]
+                wB = tracks[b]['bbox'][2] - tracks[b]['bbox'][0]
+                dist = np.hypot(cA[0] - cB[0], cA[1] - cB[1])
+
+                if dist < DISTANCE_OVERLAP_RATIO * ((wA + wB) / 2):
+                    sA, sB = speed(a), speed(b)
+                    if (sA > VELOCITY_THRESHOLD and sB < sA * 0.7) or \
+                       (sB > VELOCITY_THRESHOLD and sA < sB * 0.7):
+
+                        key = f"{min(a,b)}_{max(a,b)}"
+                        suspicious[key] += 1
+
+                        if suspicious[key] >= MIN_FRAMES_TO_FLAG:
+                            out = f"outputs/event_{int(time.time())}.mp4"
+                            frames = list(ring)[-buf_frames:]
+
+                            for _ in range(postbuf_frames):
+                                r2, f2 = cap.read()
+                                if not r2:
+                                    break
+                                frames.append(f2)
+
+                            h, w = frames[0].shape[:2]
+                            vw = cv2.VideoWriter(out,
+                                                 cv2.VideoWriter_fourcc(*"mp4v"),
+                                                 fps, (w, h))
+                            for f in frames:
+                                vw.write(f)
+                            vw.release()
+
+                            print(f"🚨 Kidnapping detected → {out}")
+                            saved += 1
+                            suspicious[key] = 0
+
+    cap.release()
+
+    if saved:
+        print(f"\n🚨 Total events saved: {saved}")
+    else:
+        print("\n✅ No kidnapping detected")
+
+if __name__ == "__main__":
+    video_path = "samples/sample_video.mp4"
+    process_video_file(video_path)
+
